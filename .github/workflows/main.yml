@@ -1,34 +1,18 @@
 name: Run NBA Team Stats
-
 on:
   workflow_dispatch:
     inputs:
-      team_abbr:
-        description: 'Team abbreviation (e.g. BOS)'
-        required: true
-        default: 'BOS'
-
+      team1: {description: "Team 1", required: true, default: "LAL"}
+      team2: {description: "Team 2", required: true, default: "OKC"}
+      page_url: {description: "Notion page URL", required: true}
 jobs:
   run-script:
     runs-on: ubuntu-latest
-
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Set up Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: '3.12'
-
-      - name: Install packages
-        run: pip install -r requirements.txt
-
-      - name: Run script
-        run: echo "${{ github.event.inputs.team_abbr }}" | python nba_team_stats.py
-
-      - name: Upload xlsx
-        uses: actions/upload-artifact@v4
-        with:
-          name: nba-team-stats
-          path: "*.xlsx"
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: {python-version: "3.12"}
+      - run: pip install -r requirements.txt
+      - run: printf "%s\n%s\n%s\n" "${{ github.event.inputs.team1 }}" "${{ github.event.inputs.team2 }}" "${{ github.event.inputs.page_url }}" | python nba_team_stats.py
+        env:
+          NOTION_TOKEN: ${{ secrets.NOTION_TOKEN }}
