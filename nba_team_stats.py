@@ -1,4 +1,5 @@
-import os, io, re, requests, matplotlib.pyplot as plt
+import os, io, re, time, requests, matplotlib.pyplot as plt
+from requests.exceptions import ReadTimeout, RequestException
 from nba_api.stats.endpoints import leaguedashteamstats
 
 NOTION_TOKEN = os.environ["NOTION_TOKEN"]
@@ -32,6 +33,25 @@ def extract_page_id(page_url: str) -> str:
         raise ValueError("ページURLからpage_idを取得できません")
     raw = m.group(1).lower()
     return f"{raw[0:8]}-{raw[8:12]}-{raw[12:16]}-{raw[16:20]}-{raw[20:32]}"
+
+def fetch_team_stats(max_retries=3, wait_seconds=5):
+    last_error = None
+    for attempt in range(1, max_retries + 1):
+        try:
+            df = leaguedashteamstats.LeagueDashTeamStats(
+                season='2025-26',
+                season_type_all_star='Regular Season',
+                per_mode_detailed='PerGame',
+                measure_type_detailed_defense='Advanced',
+                timeout=60
+            ).get_data_frames()[0]
+            return df
+        except (ReadTimeout, RequestException) as e:
+            last_error = e
+            print(f"NBA.com取得失敗 {attempt}/{max_retries}: {e}")
+            if attempt < max_retries:
+                time.sleep(wait_seconds)
+    raise RuntimeError(f"NBA.com取得に失敗しました: {last_error}")
 
 def make_team_png(team_abbr, df):
     team_name = TEAM_MAP[team_abbr]
@@ -119,13 +139,7 @@ def main():
         raise SystemExit("略称エラー")
 
     page_id = extract_page_id(page_url)
-
-    df = leaguedashteamstats.LeagueDashTeamStats(
-        season='2025-26',
-        season_type_all_star='Regular Season',
-        per_mode_detailed='PerGame',
-        measure_type_detailed_defense='Advanced'
-    ).get_data_frames()[0]
+    df = fetch_team_stats()
 
     for abbr in [team1, team2]:
         png = make_team_png(abbr, df)
