@@ -1,10 +1,10 @@
+import os, io, re, requests, matplotlib.pyplot as plt
 from nba_api.stats.endpoints import leaguedashteamstats
-from openpyxl import load_workbook
-from openpyxl.styles import PatternFill
 
-team_abbr = input('チーム略称を入力してください: ').upper()
+NOTION_TOKEN = os.environ["NOTION_TOKEN"]
+NOTION_VERSION = "2026-03-11"
 
-team_map = {
+TEAM_MAP = {
     'ATL':'Atlanta Hawks','BOS':'Boston Celtics','BKN':'Brooklyn Nets',
     'CHA':'Charlotte Hornets','CHI':'Chicago Bulls','CLE':'Cleveland Cavaliers',
     'DAL':'Dallas Mavericks','DEN':'Denver Nuggets','DET':'Detroit Pistons',
@@ -17,42 +17,122 @@ team_map = {
     'TOR':'Toronto Raptors','UTA':'Utah Jazz','WAS':'Washington Wizards'
 }
 
-if team_abbr not in team_map:
-    print('無効な略称です')
-    exit()
+def notion_headers(json_mode=True):
+    h = {
+        "Authorization": f"Bearer {NOTION_TOKEN}",
+        "Notion-Version": NOTION_VERSION,
+    }
+    if json_mode:
+        h["Content-Type"] = "application/json"
+    return h
 
-team_name = team_map[team_abbr]
+def extract_page_id(page_url: str) -> str:
+    m = re.search(r'([0-9a-fA-F]{32})', page_url)
+    if not m:
+        raise ValueError("ページURLからpage_idを取得できません")
+    raw = m.group(1).lower()
+    return f"{raw[0:8]}-{raw[8:12]}-{raw[12:16]}-{raw[16:20]}-{raw[20:32]}"
 
-df = leaguedashteamstats.LeagueDashTeamStats(
-    season='2025-26',
-    season_type_all_star='Regular Season',
-    per_mode_detailed='PerGame',
-    measure_type_detailed_defense='Advanced'
-).get_data_frames()[0]
+def make_team_png(team_abbr, df):
+    team_name = TEAM_MAP[team_abbr]
+    out = df[['TEAM_NAME','W','L','OFF_RATING','DEF_RATING']].copy()
+    out['W_RANK'] = out['W'].rank(ascending=False, method='min').astype(int)
+    out['L_RANK'] = out['L'].rank(ascending=True, method='min').astype(int)
+    out['OFF_RATING_RANK'] = out['OFF_RATING'].rank(ascending=False, method='min').astype(int)
+    out['DEF_RATING_RANK'] = out['DEF_RATING'].rank(ascending=True, method='min').astype(int)
+    row = out[out['TEAM_NAME'] == team_name].iloc[0]
 
-out = df[['TEAM_NAME','W','L','OFF_RATING','DEF_RATING']].copy()
-out['W_RANK'] = out['W'].rank(ascending=False, method='min').astype(int)
-out['L_RANK'] = out['L'].rank(ascending=True, method='min').astype(int)
-out['OFF_RATING_RANK'] = out['OFF_RATING'].rank(ascending=False, method='min').astype(int)
-out['DEF_RATING_RANK'] = out['DEF_RATING'].rank(ascending=True, method='min').astype(int)
+    fig, ax = plt.subplots(figsize=(6, 3.2))
+    ax.axis("off")
+    lines = [
+        f"{team_abbr}  {team_name}",
+        f"W: {row['W']}  (Rank {row['W_RANK']})",
+        f"L: {row['L']}  (Rank {row['L_RANK']})",
+        f"OFF RTG: {row['OFF_RATING']:.1f}  (Rank {row['OFF_RATING_RANK']})",
+        f"DEF RTG: {row['DEF_RATING']:.1f}  (Rank {row['DEF_RATING_RANK']})",
+    ]
+    y = 0.9
+    for i, t in enumerate(lines):
+        ax.text(0.02, y, t, fontsize=14 if i == 0 else 12, va="top")
+        y -= 0.18
 
-team_out = out[out['TEAM_NAME'] == team_name].copy()
+    buf = io.BytesIO()
+    plt.savefig(buf, format="png", dpi=200, bbox_inches="tight")
+    plt.close(fig)
+    buf.seek(0)
+    return buf
 
-file_name = f'{team_abbr}_team_stats.xlsx'
-team_out.to_excel(file_name, index=False)
+def upload_small_file_to_notion(filename, fileobj):
+    r1 = requests.post(
+        "https://api.notion.com/v1/file_uploads",
+        headers=notion_headers(),
+        json={"mode": "single_part", "filename": filename, "content_type": "image/png"}
+    )
+    r1.raise_for_status()
+    upload_id = r1.json()["id"]
 
-wb = load_workbook(file_name)
-ws = wb.active
-red = PatternFill(fill_type='solid', fgColor='FFC7CE')
-blue = PatternFill(fill_type='solid', fgColor='CFE2F3')
+    r2 = requests.post(
+        f"https://api.notion.com/v1/file_uploads/{upload_id}/send",
+        headers={
+            "Authorization": f"Bearer {NOTION_TOKEN}",
+            "Notion-Version": NOTION_VERSION,
+        },
+        files={"file": (filename, fileobj, "image/png")}
+    )
+    r2.raise_for_status()
 
-for col in [6, 7, 8, 9]:
-    v = ws.cell(row=2, column=col).value
-    if v <= 10:
-        ws.cell(row=2, column=col).fill = red
-    elif v >= 21:
-        ws.cell(row=2, column=col).fill = blue
+    r3 = requests.post(
+        f"https://api.notion.com/v1/file_uploads/{upload_id}/complete",
+        headers=notion_headers(),
+        json={}
+    )
+    r3.raise_for_status()
+    return upload_id
 
-wb.save(file_name)
-print(f'{file_name} を保存しました')
-print(team_out)
+def append_image_block(page_id, file_upload_id, caption):
+    payload = {
+        "children": [
+            {
+                "object": "block",
+                "type": "image",
+                "image": {
+                    "type": "file_upload",
+                    "file_upload": {"id": file_upload_id},
+                    "caption": [{"type": "text", "text": {"content": caption}}]
+                }
+            }
+        ]
+    }
+    r = requests.patch(
+        f"https://api.notion.com/v1/blocks/{page_id}/children",
+        headers=notion_headers(),
+        json=payload
+    )
+    r.raise_for_status()
+
+def main():
+    team1 = input("1つ目の略称: ").upper().strip()
+    team2 = input("2つ目の略称: ").upper().strip()
+    page_url = input("NotionページURL: ").strip()
+
+    if team1 not in TEAM_MAP or team2 not in TEAM_MAP:
+        raise SystemExit("略称エラー")
+
+    page_id = extract_page_id(page_url)
+
+    df = leaguedashteamstats.LeagueDashTeamStats(
+        season='2025-26',
+        season_type_all_star='Regular Season',
+        per_mode_detailed='PerGame',
+        measure_type_detailed_defense='Advanced'
+    ).get_data_frames()[0]
+
+    for abbr in [team1, team2]:
+        png = make_team_png(abbr, df)
+        upload_id = upload_small_file_to_notion(f"{abbr}_stats.png", png)
+        append_image_block(page_id, upload_id, f"{abbr} team stats")
+
+    print("Notion投稿完了")
+
+if __name__ == "__main__":
+    main()
